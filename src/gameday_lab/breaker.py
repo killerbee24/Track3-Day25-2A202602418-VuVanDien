@@ -91,7 +91,21 @@ class SlidingWindowBreaker:
            elif slow rate (slow and not failed) >= slow_rate_threshold
                                                         -> _move(OPEN, "slow_call_rate")
         """
-        raise NotImplementedError("TODO(student): _record()")
+        self._window.append((failed, slow))
+        while len(self._window) > self.window_size:
+            self._window.popleft()
+        if len(self._window) < self.min_calls:
+            return
+
+        total = len(self._window)
+        failure_rate = sum(int(was_failed) for was_failed, _ in self._window) / total
+        if failure_rate >= self.failure_rate_threshold:
+            self._move(now, BreakerState.OPEN, "failure_rate")
+            return
+
+        slow_rate = sum(int(was_slow and not was_failed) for was_failed, was_slow in self._window) / total
+        if slow_rate >= self.slow_rate_threshold:
+            self._move(now, BreakerState.OPEN, "slow_call_rate")
 
     def allow(self, now: float) -> Permit | None:
         """Return a Permit if a request may be sent now, else None.
@@ -103,7 +117,18 @@ class SlidingWindowBreaker:
                      else probes_in_flight += 1 and return Permit(name, generation, probe=True)
         * CLOSED: return Permit(name, generation, probe=False)
         """
-        raise NotImplementedError("TODO(student): allow()")
+        if self.state is BreakerState.OPEN:
+            if now - self.opened_at < self.open_duration_s:
+                return None
+            self._move(now, BreakerState.HALF_OPEN, "open_timeout_elapsed")
+
+        if self.state is BreakerState.HALF_OPEN:
+            if self.probes_in_flight >= self.half_open_max_probes:
+                return None
+            self.probes_in_flight += 1
+            return Permit(self.name, self.generation, probe=True)
+
+        return Permit(self.name, self.generation, probe=False)
 
     def on_success(self, permit: Permit, now: float, latency_s: float) -> None:
         """TODO(student):
@@ -114,7 +139,20 @@ class SlidingWindowBreaker:
                      it reaches half_open_successes
         * CLOSED: _record(now, failed=False, slow=slow)
         """
-        raise NotImplementedError("TODO(student): on_success()")
+        if permit.generation != self.generation:
+            return
+        slow = latency_s >= self.slow_call_s
+        if self.state is BreakerState.HALF_OPEN:
+            self.probes_in_flight = max(0, self.probes_in_flight - 1)
+            if slow:
+                self._move(now, BreakerState.OPEN, "probe_slow")
+                return
+            self.probe_successes += 1
+            if self.probe_successes >= self.half_open_successes:
+                self._move(now, BreakerState.CLOSED, "probes_succeeded")
+            return
+        if self.state is BreakerState.CLOSED:
+            self._record(now, failed=False, slow=slow)
 
     def on_failure(self, permit: Permit, now: float) -> None:
         """Only called for errors that count toward the breaker.
@@ -122,7 +160,13 @@ class SlidingWindowBreaker:
         TODO(student): stale -> ignore; HALF_OPEN -> _move(OPEN, "probe_failed");
         CLOSED -> _record(now, failed=True, slow=False).
         """
-        raise NotImplementedError("TODO(student): on_failure()")
+        if permit.generation != self.generation:
+            return
+        if self.state is BreakerState.HALF_OPEN:
+            self._move(now, BreakerState.OPEN, "probe_failed")
+            return
+        if self.state is BreakerState.CLOSED:
+            self._record(now, failed=True, slow=False)
 
     def release(self, permit: Permit, now: float) -> None:
         """The attempt ended without telling us anything about provider health
@@ -130,4 +174,7 @@ class SlidingWindowBreaker:
 
         TODO(student): stale -> ignore; if HALF_OPEN and permit.probe -> probes_in_flight -= 1 (not below 0).
         """
-        raise NotImplementedError("TODO(student): release()")
+        if permit.generation != self.generation:
+            return
+        if self.state is BreakerState.HALF_OPEN and permit.probe:
+            self.probes_in_flight = max(0, self.probes_in_flight - 1)
